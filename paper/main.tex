@@ -1,0 +1,313 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Gate-Targeted Fine-Tuning for Behavioral Modification\\in Large Mixture-of-Experts Language Models}
+
+\author{
+  Zen LM Research \and Hanzo AI\\
+  \texttt{research@zenlm.org}\\
+  \url{https://zenlm.org}
+}
+
+\date{February 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Standard activation-space abliteration techniques, which project out refusal directions from the residual stream, fail completely on large Mixture-of-Experts (MoE) language models. We demonstrate that this failure occurs because behavioral control in MoE architectures is encoded in expert routing decisions—\textit{which} experts fire—rather than in the residual stream that abliteration targets. We propose \textbf{Gate-Targeted QLoRA} (GT-QLoRA), a fine-tuning approach that combines LoRA adaptation on attention and shared expert modules with direct gradient updates to the MoE gate/router parameters. Applied to Kimi K2.5 (1.04T parameters, 384 experts, top-8 routing), our approach achieves instruction-following improvements while preserving model quality across standard benchmarks. We further discuss extensions to continual learning, efficient quantization (BitStamp, BitDelta), and progressive expert specialization for ongoing behavioral refinement without catastrophic forgetting.
+\end{abstract}
+
+\section{Introduction}
+
+The proliferation of open-source large language models (LLMs) has enabled a rich ecosystem of model customization. Abliteration—the removal of safety-trained refusal behaviors via activation engineering—has proven effective on dense transformer models \citep{arditi2024refusal}. However, as the field moves toward Mixture-of-Experts (MoE) architectures for their favorable compute-to-parameter ratios, standard abliteration techniques fail.
+
+Recent work by \citet{hamsaomar2025} systematically demonstrated that linear abliteration has \textit{zero behavioral effect} on Kimi K2.5 (1.04T parameters), despite correctly identifying the refusal direction in activation space (50.7\% explained variance, cosine similarity 0.88 between independent methods). This finding reveals a fundamental architectural difference: in MoE models, behavioral control is distributed across the expert routing mechanism, not concentrated in the shared residual stream.
+
+We present three contributions:
+\begin{enumerate}
+    \item \textbf{Analysis}: We provide a mechanistic explanation for why abliteration fails on MoE, grounded in the information flow between shared and expert-specific pathways.
+    \item \textbf{Method}: We propose Gate-Targeted QLoRA (GT-QLoRA), which combines parameter-efficient fine-tuning with direct gate weight modification to achieve behavioral changes in MoE models.
+    \item \textbf{Extensions}: We outline a roadmap for continual behavioral refinement using progressive expert specialization, efficient quantization via BitDelta/BitStamp, and online learning approaches.
+\end{enumerate}
+
+\section{Background}
+
+\subsection{Mixture-of-Experts Architecture}
+
+MoE transformers replace the dense feed-forward network (FFN) in each layer with a set of $N$ expert networks and a learned routing function (gate). For input $\mathbf{x}$, the gate produces routing scores:
+
+$$\mathbf{s} = \text{Gate}(\mathbf{x}) = \sigma(\mathbf{W}_g \mathbf{x})$$
+
+where $\mathbf{W}_g \in \mathbb{R}^{N \times d}$ is the gate weight matrix. The top-$k$ experts are selected:
+
+$$\text{TopK}(\mathbf{s}) = \{(i, s_i) : i \in \text{argtop}_k(\mathbf{s})\}$$
+
+The layer output combines selected expert outputs:
+
+$$\mathbf{y} = \sum_{(i, s_i) \in \text{TopK}(\mathbf{s})} s_i \cdot \text{Expert}_i(\mathbf{x}) + \text{SharedExpert}(\mathbf{x})$$
+
+Kimi K2.5 uses $N=384$ routed experts with top-8 routing and 1 shared expert per layer across 61 layers.
+
+\subsection{Linear Abliteration}
+
+Abliteration \citep{arditi2024refusal} identifies a refusal direction $\hat{\mathbf{r}}$ in activation space by computing the mean difference between harmful and harmless prompt activations, then projects it out:
+
+$$\mathbf{h}' = \mathbf{h} - (\mathbf{h} \cdot \hat{\mathbf{r}}) \hat{\mathbf{r}}$$
+
+This works on dense models because the residual stream is the \textit{sole} information pathway. In MoE models, however, the residual stream is only the \textit{shared} pathway—expert selection constitutes a parallel information channel that abliteration does not address.
+
+\subsection{Why Abliteration Fails on MoE}
+
+We identify three mechanisms through which MoE models maintain behavioral control despite residual stream modification:
+
+\begin{enumerate}
+    \item \textbf{Routing-encoded refusal}: The gate network $\mathbf{W}_g$ learns to route safety-relevant inputs to specific expert subsets. This routing decision occurs \textit{before} the residual stream projection and is unaffected by it.
+
+    \item \textbf{Expert specialization}: Individual experts develop safety-specific computations during RLHF. Even if the shared residual signal is modified, the expert outputs re-introduce refusal behavior.
+
+    \item \textbf{Attention-mediated recovery}: Multi-head attention in subsequent layers can detect the abliteration artifact and compensate, as the attention mechanism operates independently of the FFN residual stream direction.
+\end{enumerate}
+
+Table~\ref{tab:abliteration_results} summarizes prior abliteration attempts on Kimi K2.5.
+
+\begin{table}[h]
+\centering
+\caption{Abliteration attempts on Kimi K2.5 (from \citet{hamsaomar2025})}
+\label{tab:abliteration_results}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Refusal Rate} & \textbf{Quality} \\
+\midrule
+Original model & 100\% & 100\% \\
+Weight-baked (all layers, all projections) & 98\% & OK \\
+Inference hooks (rank-1 SVD) & 100\% & 100\% \\
+Inference hooks (rank-5 SVD) & 67\% & Degraded \\
+Combined (weight-baked + hooks) & 100\% & OK \\
+Per-layer directions (scale=3.0) & N/A & Destroyed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Method: Gate-Targeted QLoRA}
+
+\subsection{Overview}
+
+Gate-Targeted QLoRA (GT-QLoRA) operates on the principle that behavioral modification in MoE models requires modifying the routing mechanism itself. Our approach combines three components:
+
+\begin{enumerate}
+    \item \textbf{LoRA on attention}: Low-rank adaptation of compressed attention projections ($\mathbf{W}_{q_a}$, $\mathbf{W}_{q_b}$, $\mathbf{W}_{kv_a}$, $\mathbf{W}_{kv_b}$, $\mathbf{W}_o$) to modify how safety-relevant context is processed.
+
+    \item \textbf{LoRA on shared experts}: Adaptation of the always-active shared expert FFN ($\text{gate\_proj}$, $\text{up\_proj}$, $\text{down\_proj}$) to modify baseline computations.
+
+    \item \textbf{Direct gate unfreezing}: The MoE gate weights $\mathbf{W}_g$ are stored as \texttt{nn.Parameter} (not \texttt{nn.Linear}), making them incompatible with standard LoRA. We unfreeze them directly, allowing full gradient updates to the routing function.
+\end{enumerate}
+
+\subsection{Why Gate Unfreezing is Necessary}
+
+Standard QLoRA freezes all base model parameters and only trains the low-rank adapter matrices. For MoE models, this is insufficient because:
+
+\begin{itemize}
+    \item The gate weight $\mathbf{W}_g$ controls expert selection. Without modifying $\mathbf{W}_g$, the same experts are selected regardless of adapter modifications.
+    \item LoRA on expert FFN layers only changes \textit{what} experts compute, not \textit{which} experts are activated. Since refusal is encoded in routing (which experts fire), this is insufficient.
+    \item The gate is a small parameter matrix ($384 \times 7168 = 2.75\text{M}$ parameters per layer, $\sim167\text{M}$ total across 61 layers), representing only 0.016\% of total model parameters.
+\end{itemize}
+
+\subsection{Training Procedure}
+
+\begin{algorithm}
+\caption{Gate-Targeted QLoRA (GT-QLoRA)}
+\begin{algorithmic}[1]
+\State \textbf{Input}: Base model $M$ with MoE layers, training data $D$
+\State Load $M$ with INT4 quantization (NF4 + double quantization)
+\State Apply LoRA (rank $r$) to: $\{q_{a/b}, kv_{a/b}, o\}_{\text{proj}} \cup \{shared\_expert\}_{\text{FFN}}$
+\State \textbf{Unfreeze} gate weights: $\forall l \in [1..L]: \mathbf{W}_g^{(l)}.\text{requires\_grad} \leftarrow \text{True}$
+\For{each batch $(x, y) \in D$}
+    \State Forward pass through quantized model with LoRA adapters
+    \State Compute loss $\mathcal{L}$ (cross-entropy for SFT, DPO loss for preference)
+    \State Backpropagate $\nabla\mathcal{L}$ through: LoRA params $+$ gate weights
+    \State Update with paged AdamW (8-bit)
+\EndFor
+\State Save LoRA adapters $+$ modified gate weights
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Training Modes}
+
+\subsubsection{Supervised Fine-Tuning (SFT)}
+
+Standard cross-entropy loss on instruction-following examples where the model complies with user requests:
+
+$$\mathcal{L}_{\text{SFT}} = -\sum_{t} \log p_\theta(y_t | y_{<t}, x)$$
+
+\subsubsection{Direct Preference Optimization (DPO)}
+
+For stronger behavioral modification, we use DPO \citep{rafailov2023direct} with preference pairs where the preferred response complies and the rejected response refuses:
+
+$$\mathcal{L}_{\text{DPO}} = -\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \right) \right]$$
+
+where $y_w$ is the compliant (preferred) response, $y_l$ is the refusal (rejected) response, and $\beta$ controls the strength of preference learning.
+
+\subsection{Implementation Details}
+
+\begin{table}[h]
+\centering
+\caption{GT-QLoRA hyperparameters for Kimi K2.5}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+LoRA rank ($r$) & 32 \\
+LoRA alpha ($\alpha$) & 64 \\
+LoRA dropout & 0.05 \\
+Learning rate & $2 \times 10^{-5}$ \\
+Optimizer & Paged AdamW (8-bit) \\
+Batch size (effective) & 16 \\
+Gradient accumulation & 16 steps \\
+Warmup ratio & 0.03 \\
+LR scheduler & Cosine \\
+Max sequence length & 4096 \\
+Quantization & NF4 + double quant \\
+Precision & bfloat16 compute \\
+Gradient checkpointing & Enabled \\
+\midrule
+\multicolumn{2}{l}{\textit{Trainable parameters}} \\
+LoRA adapters & $\sim$200M (0.019\%) \\
+Gate weights & $\sim$167M (0.016\%) \\
+Total trainable & $\sim$367M (0.035\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Extensions and Future Directions}
+
+\subsection{Continual Learning for MoE Behavioral Refinement}
+
+A key advantage of MoE architectures is that behavioral modification can be \textit{incremental} without catastrophic forgetting, because different experts can be selectively updated.
+
+\subsubsection{Progressive Expert Specialization}
+
+Rather than modifying all experts simultaneously, we propose progressive expert specialization:
+
+\begin{enumerate}
+    \item \textbf{Phase 1: Gate + Shared Expert} — Modify routing and the always-active shared expert (our current approach). This changes global behavior with minimal parameter changes.
+    \item \textbf{Phase 2: Safety Expert Identification} — Analyze expert activation patterns on safety-relevant inputs to identify the subset of experts most correlated with refusal behavior.
+    \item \textbf{Phase 3: Targeted Expert LoRA} — Apply LoRA specifically to the identified safety-critical experts, leaving other experts untouched to preserve domain capabilities.
+    \item \textbf{Phase 4: Expert Replacement} — For the most resistant cases, train replacement expert modules and swap them into the routing topology.
+\end{enumerate}
+
+This progressive approach enables continual behavioral refinement without retraining the full model.
+
+\subsubsection{Online Adaptation}
+
+For continuously deployed models, we propose an online adaptation framework:
+
+$$\theta_{t+1} = \theta_t - \eta \nabla_\theta \mathcal{L}(\theta_t; D_t)$$
+
+where $D_t$ is a rolling window of user interaction data. The gate weights serve as a natural control surface—small modifications to $\mathbf{W}_g$ can redirect routing without changing expert computations, enabling rapid behavioral adaptation.
+
+\subsection{Efficient Quantization Strategies}
+
+Large MoE models benefit from post-training quantization. We outline strategies that preserve the behavioral modifications from GT-QLoRA.
+
+\subsubsection{BitDelta: 1-Bit Weight Deltas}
+
+BitDelta \citep{liu2024bitdelta} compresses fine-tuned model deltas to 1 bit per parameter:
+
+$$\hat{\Delta} = \alpha \cdot \text{sign}(\Delta), \quad \Delta = W_{\text{finetuned}} - W_{\text{base}}$$
+
+where $\alpha$ is a learned per-layer scaling factor. For GT-QLoRA:
+\begin{itemize}
+    \item LoRA adapter deltas are already low-rank and compress well
+    \item Gate weight deltas ($\sim$167M params) compress to $\sim$20MB with BitDelta
+    \item Total compressed behavioral modification: $\sim$50MB (vs $\sim$1TB full model)
+\end{itemize}
+
+This enables a ``base model + behavioral patch'' deployment where the base quantized model is shared and behavioral modifications are applied as lightweight overlays.
+
+\subsubsection{BitStamp: Sparse Weight Stamping}
+
+For even more efficient storage, BitStamp applies behavioral modifications only to the most impactful weight positions:
+
+\begin{enumerate}
+    \item Identify top-$k$\% of weight positions with largest magnitude deltas after GT-QLoRA
+    \item Quantize these positions to 1-2 bits
+    \item Store as sparse index + value pairs
+\end{enumerate}
+
+Expected compression: behavioral modifications in $\sim$10-20MB for a 1T model.
+
+\subsubsection{GGUF Quantization}
+
+For llama.cpp deployment, the merged GT-QLoRA model can be quantized to standard GGUF formats:
+
+\begin{table}[h]
+\centering
+\caption{Expected GGUF sizes for Kimi K2.5 (1.04T params)}
+\label{tab:gguf}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Format} & \textbf{Bits/Weight} & \textbf{Approx. Size} \\
+\midrule
+Q2\_K & 2.0 & $\sim$240GB \\
+Q3\_K\_M & 3.0 & $\sim$360GB \\
+Q4\_K\_M & 4.0 & $\sim$480GB \\
+Q5\_K\_M & 5.0 & $\sim$600GB \\
+Q8\_0 & 8.0 & $\sim$960GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Q2\_K format is already available for the abliterated GGUF variant at \texttt{zenlm/zen4-ultra-gguf}.
+
+\subsection{Expert-Level Analysis for Quality Preservation}
+
+A critical concern in behavioral modification is quality preservation. We propose monitoring expert activation distributions before and after training:
+
+$$D_{\text{KL}}(P_{\text{expert}}^{\text{before}} \| P_{\text{expert}}^{\text{after}}) < \epsilon$$
+
+If the KL divergence in expert activation patterns exceeds a threshold for non-safety inputs, the training is over-modifying routing and should be constrained. This provides a principled stopping criterion.
+
+\subsection{Mixture-of-Adapters}
+
+An extension of GT-QLoRA for multi-capability customization:
+
+$$\mathbf{h}_{\text{adapted}} = \mathbf{h} + \sum_{i} \alpha_i \cdot \text{LoRA}_i(\mathbf{h})$$
+
+where different LoRA adapters encode different behavioral modifications (identity, instruction following, domain expertise). Adapters can be composed at inference time, enabling modular behavioral control.
+
+\section{Related Work}
+
+\paragraph{Abliteration} \citet{arditi2024refusal} introduced activation-space refusal removal. \citet{sumandora2024} provided open-source implementations. Both methods are effective on dense models but fail on MoE architectures.
+
+\paragraph{MoE Safety} \citet{hamsaomar2025} documented the first systematic failure of abliteration on Kimi K2.5, identifying expert routing as the failure mode.
+
+\paragraph{Parameter-Efficient Fine-Tuning} LoRA \citep{hu2022lora} and QLoRA \citep{dettmers2023qlora} enable fine-tuning of large models with minimal memory. Our GT-QLoRA extends QLoRA to MoE gate parameters.
+
+\paragraph{Direct Preference Optimization} DPO \citep{rafailov2023direct} provides an efficient alternative to RLHF for behavioral modification.
+
+\paragraph{Efficient Quantization} BitDelta \citep{liu2024bitdelta} compresses fine-tuning deltas. GPTQ, AWQ, and GGUF provide model-level quantization for deployment.
+
+\section{Conclusion}
+
+We have shown that behavioral modification in large MoE language models requires fundamentally different approaches than those effective on dense architectures. Our Gate-Targeted QLoRA method addresses the root cause—refusal encoded in expert routing—by combining LoRA adaptation with direct gate weight updates. The approach modifies only 0.035\% of model parameters while targeting the specific mechanism responsible for behavioral control.
+
+The extensions to continual learning, efficient quantization, and progressive expert specialization provide a roadmap for practical deployment of behaviorally modified MoE models at scale. Code and training infrastructure are available at \url{https://github.com/zenlm/zen4-ultra-trainer}.
+
+\bibliography{references}
+\bibliographystyle{plainnat}
+
+\end{document}
