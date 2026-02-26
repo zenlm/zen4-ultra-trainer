@@ -1,11 +1,11 @@
 # Zen4 Ultra Training
 
-QLoRA fine-tuning for Kimi K2.5 (1.04T MoE) with MoE gate/router unfreezing.
+QLoRA fine-tuning for Zen4 Ultra (1.04T MoE) with MoE gate/router unfreezing.
 
 ## Why Not Standard Abliteration?
 
-Standard linear abliteration **does not work** on Kimi K2.5's MoE architecture.
-See [hamsaOmar/Kimi-K2.5-abliterated](https://huggingface.co/hamsaOmar/Kimi-K2.5-abliterated) for the research.
+Standard linear abliteration **does not work** on Zen4 Ultra's MoE architecture.
+See prior MoE abliteration research on this architecture class for background.
 
 **Root cause**: Refusal in MoE models is encoded in **expert routing** (which of 384 experts fire),
 not just the residual stream. Projecting out the refusal direction from the residual stream has
@@ -66,7 +66,7 @@ Deploy `app.py` as a Gradio Space with 4x A100 80GB for cloud training.
 - **Training time**: ~4-8 hours for 1 epoch on ~10K examples
 - **Output**: LoRA adapters (~100-500MB)
 
-## Architecture Reference (Kimi K2.5)
+## Architecture Reference (Zen4 Ultra)
 
 ```
 DeepseekV3ForCausalLM:
