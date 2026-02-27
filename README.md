@@ -69,7 +69,7 @@ Deploy `app.py` as a Gradio Space with 4x A100 80GB for cloud training.
 ## Architecture Reference (Zen4 Ultra)
 
 ```
-DeepseekV3ForCausalLM:
+ZenUltraForCausalLM:
   Layers: 61
   Hidden: 7168
   Experts: 384 routed (top-8) + 1 shared
